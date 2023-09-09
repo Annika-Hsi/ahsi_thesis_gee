@@ -1,0 +1,157 @@
+// Mpala shapefile import
+var MpalaImport = ee.FeatureCollection("users/annikahsi619/mpala_polygon_WGS84");
+var coords = MpalaImport.first().geometry().coordinates().get(0);
+var roi = ee.Geometry.Polygon(coords);
+Map.addLayer(roi, {}, 'Mpala Research Area');
+Map.centerObject(roi, 11); // Change amount zoomed in
+
+// Sentinel level 2A collection id
+var collectionId = "COPERNICUS/S2_SR";
+
+// Create date variables
+// May need to test out different date ranges to ensure that all "holes" left by clouds are filled
+var startDate = '2022-08-10';
+var endDate = '2022-08-12';
+
+// Save more parameters
+var cloudFilter = 60;
+var cldPrbThresh = 50;
+var nirDrkThresh = .15;
+var cldPrjDist = 1;
+var buffer = 50;
+
+function get_s2_sr_cld_col(roi, startDate, endDate) {
+  // Create a collection filtering by ROI and date
+  var s2_sr_col = ee.ImageCollection(collectionId)
+      .filterBounds(roi)
+      .filterDate(startDate, endDate)
+      .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', cloudFilter));
+      
+  // Import and filter s2cloudless
+  var s2_cloudless_col = (ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
+      .filterBounds(roi)
+      .filterDate(startDate, endDate));
+      
+  // Join the filtered s2cloudless collection to the SR collection by the 'system:index' property.
+  return ee.ImageCollection(ee.Join.saveFirst('s2cloudless').apply({
+          'primary': s2_sr_col,
+          'secondary': s2_cloudless_col,
+          'condition': ee.Filter.equals({
+              'leftField': 'system:index',
+              'rightField': 'system:index'
+          })
+      }))
+}
+
+var s2_sr_cld_col_eval = get_s2_sr_cld_col(roi, startDate, endDate);
+
+// Function to add the s2cloudless probability layer and derived cloud mask as bands to an S2 SR image input
+function add_cloud_bands(img) {
+    // Get s2cloudless image, subset the probability band.
+    var cld_prb = ee.Image(img.get('s2cloudless')).select('probability');
+
+    // Condition s2cloudless by the probability threshold value.
+    var is_cloud = cld_prb.gt(cldPrbThresh).rename('clouds');
+    
+    // Add the cloud probability layer and cloud mask as image bands.
+    return img.addBands(ee.Image([cld_prb, is_cloud]));
+}
+
+// Function to add dark pixels, cloud projection, and identified shadows as bands to an S2 SR image input
+function add_shadow_bands(img) {
+    // Identify water pixels from the SCL band.
+    var not_water = img.select('SCL').neq(6);
+
+    // Identify dark NIR pixels that are not water (potential cloud shadow pixels).
+    var SR_BAND_SCALE = 1e4;
+    var dark_pixels = img.select('B8').lt(nirDrkThresh*SR_BAND_SCALE).multiply(not_water).rename('dark_pixels');
+
+    // Determine the direction to project cloud shadow from clouds (assumes UTM projection).
+    var shadow_azimuth = ee.Number(90).subtract(ee.Number(img.get('MEAN_SOLAR_AZIMUTH_ANGLE')));
+
+    // Project shadows from clouds for the distance specified by the CLD_PRJ_DIST input.
+    var cld_proj = (img.select('clouds').directionalDistanceTransform(shadow_azimuth, 1*10)
+        .reproject({'crs': img.select(0).projection(), 'scale': 100})
+        .select('distance')
+        .mask()
+        .rename('cloud_transform'));
+
+    // Identify the intersection of dark pixels with cloud shadow projection.
+    var shadows = cld_proj.multiply(dark_pixels).rename('shadows');
+
+    // Add dark pixels, cloud projection, and identified shadows as image bands.
+    return img.addBands(ee.Image([dark_pixels, cld_proj, shadows]));
+}
+
+// Function to assemble all of the cloud and cloud shadow componenets and produce the final mask
+function add_cld_shdw_mask(img) {
+    // Add cloud component bands.
+    var img_cloud = add_cloud_bands(img);
+
+    // Add cloud shadow component bands.
+    var img_cloud_shadow = add_shadow_bands(img_cloud);
+
+    // Combine cloud and shadow mask, set cloud and shadow as value 1, else 0.
+    var is_cld_shdw = img_cloud_shadow.select('clouds').add(img_cloud_shadow.select('shadows')).gt(0);
+
+    // Remove small cloud-shadow patches and dilate remaining pixels by BUFFER input.
+    // 20 m scale is for speed, and assumes clouds don't require 10 m precision.
+    is_cld_shdw = (is_cld_shdw.focalMin(2).focalMax(50*2/20)
+        .reproject({'crs': img.select([0]).projection(), 'scale': 20})
+        .rename('cloudmask'));
+
+    // Add the final cloud-shadow mask to the image.
+    return img_cloud_shadow.addBands(is_cld_shdw);
+}
+
+var s2_sr_cld_col_eval_disp = s2_sr_cld_col_eval.map(add_cld_shdw_mask);
+Map.addLayer(s2_sr_cld_col_eval_disp);
+
+// Redefine parameters
+cloudFilter = 60;
+cldPrbThresh = 40;
+nirDrkThresh = 0.15;
+cldPrjDist = 2;
+buffer = 100;
+
+var s2_sr_cld_col = get_s2_sr_cld_col(roi, startDate, endDate);
+
+function apply_cld_shdw_mask(img) {
+    // Subset the cloudmask band and invert it so clouds/shadow are 0, else 1.
+    var not_cld_shdw = img.select('cloudmask').not()
+
+    // Subset reflectance bands and update their masks, return the result.
+    return img.select('B.*').updateMask(not_cld_shdw);
+}
+
+var s2_sr_median = (s2_sr_cld_col.map(add_cld_shdw_mask)
+                             .map(apply_cld_shdw_mask)
+                             .median());
+    
+Map.addLayer(s2_sr_median);
+
+// Function to compute NDVI
+var computeNDVI = function (image) {
+	var exp = '( b("B8") - b("B4") ) / ( b("B8") + b("B4") )';
+	var ndvi = image.expression(exp).rename("ndvi");
+	return image.addBands(ndvi);
+};
+
+// Compute NDVI
+var s2_sr_ndvi = computeNDVI(s2_sr_median);
+
+// Prepare for export
+var ndvi_name = "Mpala-NDVI";
+var wgs84 = ee.Projection('EPSG:4326').atScale(30);
+  
+// Export NDVI        
+Export.image.toDrive({ 
+  image: s2_sr_ndvi.reproject(wgs84).select('ndvi'),
+  description: ndvi_name,
+  fileNamePrefix: ndvi_name,
+  folder: 'Mpala VI',
+  scale: 30,
+  region:roi,
+  maxPixels: 1e13
+});
+
